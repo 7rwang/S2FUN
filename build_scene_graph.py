@@ -26,18 +26,18 @@ Additional modifications in this version:
            If point in (object ∩ affordance), keep only in affordance.
 
 python build_scene_graph.py \
-  --scene_id 421254 \
-  --masks_root /nas/qirui/sam3/scenefun3d_ex/refined_masks_3d/421254/masks \
+  --scene_id 421393 \
+  --masks_root /nas/qirui/sam3/scenefun3d_ex/refined_masks_3d/421393/masks \
   --data_root /nas/qirui/scenefun3d/val \
   --depth_scale 1000 \
-  --out_json /nas/qirui/sam3/S2FUN/eval_qwen/split_30scenes/0.02/421254/scene_graph.json \
+  --out_json /nas/qirui/sam3/S2FUN/eval_qwen/split_30scenes/0.02/421393/scene_graph.json \
   --save_ply \
   --use_depth_consistency \
   --min_vis 5 \
   --min_vis_frac 0 \
   --min_fg 2 \
-  --aff_min_vis 5 \
-  --aff_min_fg 2 \
+  --aff_min_vis 2 \
+  --aff_min_fg 0 \
   --aff_min_fg_ratio 0.05 \
   --aff_min_vis_frac 0.02 \
   --min_fg_ratio 0.3 \
@@ -180,8 +180,21 @@ def list_frame_dirs(masks_root: Path) -> List[int]:
 
 
 def get_frame_dir(masks_root: Path, idx: int) -> Path:
-    p = masks_root / str(idx)
-    return p if p.is_dir() else masks_root
+    """
+    Support both:
+      masks/0
+      masks/0000
+    """
+    candidates = [
+        masks_root / str(idx),
+        masks_root / f"{idx:04d}",
+        masks_root / f"{idx:05d}",
+        masks_root / f"{idx:06d}",
+    ]
+    for p in candidates:
+        if p.is_dir():
+            return p
+    return masks_root
 
 
 def normalize_name(name: str) -> str:
@@ -920,6 +933,9 @@ def create_build_scene_graph_config(args, scene_id, seq_id, pcd_path, transform_
             'recompute_position_after_prune': args.recompute_position_after_prune,
             'rule': 'affordance_priority',
         },
+        'output_filter': {
+            'only_affordance': args.only_affordance,
+        },
         'output': {
             'save_ply': args.save_ply,
             'ply_apply_T_out': args.ply_apply_T_out,
@@ -1515,11 +1531,15 @@ def main():
     ap.add_argument("--aff_use_wilson", action="store_true")
     ap.add_argument("--aff_wilson_p0", type=float, default=0.50)
     ap.add_argument("--aff_wilson_z", type=float, default=1.96)
+    ap.add_argument("--only_affordance", action="store_true",
+                    help="If true, process and output only affordance 3D masks/nodes throughout the whole pipeline")
     args = ap.parse_args()
 
     obj_dbscan_eps = float(args.obj_dbscan_eps) if args.obj_dbscan_eps > 0 else float(args.dbscan_eps)
     aff_dbscan_eps = float(args.aff_dbscan_eps) if args.aff_dbscan_eps > 0 else float(args.dbscan_eps)
     print(f"[DBSCAN] eps: object={obj_dbscan_eps}  affordance={aff_dbscan_eps}")
+    if args.only_affordance:
+        print("[Mode] only_affordance=True -> skip object masks/groups/nodes in the whole pipeline")
 
     voxel_size = float(args.voxel_size)
 
@@ -1693,24 +1713,27 @@ def main():
             )
 
             aff_union: Optional[np.ndarray] = None
-            for mp2 in mask_paths:
-                typ_tmp, _, _ = parse_mask_type_name_inst(mp2.stem)
-                if typ_tmp != "affordance":
-                    continue
-                try:
-                    m_tmp = load_mask(mp2)
-                except Exception:
-                    continue
-                if m_tmp.sum() == 0:
-                    continue
-                mb = (m_tmp > 0)
-                aff_union = mb if aff_union is None else (aff_union | mb)
+            if not args.only_affordance:
+                for mp2 in mask_paths:
+                    typ_tmp, _, _ = parse_mask_type_name_inst(mp2.stem)
+                    if typ_tmp != "affordance":
+                        continue
+                    try:
+                        m_tmp = load_mask(mp2)
+                    except Exception:
+                        continue
+                    if m_tmp.sum() == 0:
+                        continue
+                    mb = (m_tmp > 0)
+                    aff_union = mb if aff_union is None else (aff_union | mb)
 
             used_this_frame = 0
 
             for mp in mask_paths:
                 typ, raw_name, inst_id = parse_mask_type_name_inst(mp.stem)
                 if typ not in ("object", "affordance"):
+                    continue
+                if args.only_affordance and typ != "affordance":
                     continue
 
                 try:
@@ -1755,6 +1778,8 @@ def main():
                       f"{used_this_frame} masks, groups={len(groups_map)}")
 
         groups_list = list(groups_map.values())
+        if args.only_affordance:
+            groups_list = [g for g in groups_list if g.typ == "affordance"]
         print(f"\nTotal masks used: {total_masks_used}")
         print(f"Semantic groups:  {len(groups_list)}")
 
@@ -1871,18 +1896,34 @@ def main():
         else:
             merge_info_all["object_bbox_merge"] = {"enabled": False}
 
-        nodes_with_indices, own_info = enforce_affordance_priority_ownership(
-            nodes_with_indices, world_pts, T_out,
-            bool(args.use_dbscan_position), float(obj_dbscan_eps), int(args.dbscan_min_samples),
-        )
-        print(f"[Ownership-AffordancePriority] removed_points={own_info['removed_points']} "
-              f"dropped_obj={own_info['dropped_object_nodes']}")
+        if args.only_affordance:
+            own_info = {
+                "enabled": False,
+                "skipped": True,
+                "reason": "only_affordance=True; object branch is disabled in the whole pipeline",
+                "removed_points": 0,
+                "dropped_object_nodes": 0,
+            }
+        else:
+            nodes_with_indices, own_info = enforce_affordance_priority_ownership(
+                nodes_with_indices, world_pts, T_out,
+                bool(args.use_dbscan_position), float(obj_dbscan_eps), int(args.dbscan_min_samples),
+            )
+            print(f"[Ownership-AffordancePriority] removed_points={own_info['removed_points']} "
+                  f"dropped_obj={own_info['dropped_object_nodes']}")
 
         nodes_with_indices = sorted(
             nodes_with_indices,
             key=lambda x: (x[0]["type"], x[0]["name"], x[0].get("inst_id", ""),
                            *x[0]["position"])
         )
+
+        if args.only_affordance:
+            nodes_with_indices = [
+                (node, idxset) for node, idxset in nodes_with_indices
+                if node.get("type") == "affordance"
+            ]
+            print(f"[OutputFilter] only_affordance=True -> kept {len(nodes_with_indices)} affordance nodes")
 
         nodes: List[dict] = []
         node_indices_rows: List[dict] = []
@@ -1965,6 +2006,7 @@ def main():
                 "ply_voxel_down": float(args.ply_voxel_down),
                 "merge_nodes": merge_info_all,
                 "ownership": own_info,
+                "only_affordance": bool(args.only_affordance),
             }
         }
 

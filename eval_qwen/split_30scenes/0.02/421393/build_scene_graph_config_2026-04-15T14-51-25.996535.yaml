@@ -1,0 +1,81 @@
+experiment:
+  timestamp: '2026-04-15T14:51:25.996535'
+  script_name: build_scene_graph.py
+  version: 2.0.0
+  description: Build 3D scene graph with optimized frame-cache, vectorized vote, object-bbox-merge,
+    and affordance-priority ownership
+scene_data:
+  scene_id: 421393
+  sequence_id: '42444923'
+  pcd_path: /nas/qirui/scenefun3d/val/421393/421393_laser_scan.ply
+  transform_npy: /nas/qirui/scenefun3d/val/421393/42444923/42444923_transform.npy
+  name_map_json: null
+  depth_dir: /nas/qirui/scenefun3d/val/421393/42444923/hires_depth
+input_paths:
+  masks_root: /nas/qirui/sam3/scenefun3d_ex/refined_masks_3d/421393/masks
+  data_root: /nas/qirui/scenefun3d/val
+  out_root: null
+  out_json: /nas/qirui/sam3/S2FUN/eval_qwen/split_30scenes/0.02/421393/scene_graph.json
+  ply_dir: auto
+point_cloud:
+  pcd_apply_transform: ''
+  pcd_transform_invert: false
+  voxel_size: 0.0
+camera_parameters:
+  frame_stride: 1
+  transform_invert: false
+  disable_transform: false
+depth_consistency:
+  use_depth_consistency: true
+  depth_scale: 1000.0
+  depth_tau_min: 0.05
+  depth_tau_k: 3.0
+  depth_tau_front: 0.1
+clustering:
+  use_dbscan_position: true
+  dbscan_eps: 1.0
+  dbscan_min_samples: 10
+  obj_dbscan_eps: 1.0
+  aff_dbscan_eps: 0.03
+filtering:
+  use_wilson: false
+  wilson_p0: 0.7
+  wilson_z: 1.96
+  min_vis: 5
+  min_vis_frac: 0.0
+  min_fg: 2
+  min_fg_ratio: 0.3
+affordance_filtering:
+  aff_min_vis: 5
+  aff_min_vis_frac: 0.02
+  aff_min_fg: 2
+  aff_min_fg_ratio: 0.05
+  aff_use_wilson: false
+  aff_wilson_p0: 0.5
+  aff_wilson_z: 1.96
+node_merging:
+  merge_nodes: true
+  merge_min_common: 50
+  merge_min_ratio: 0.3
+  merge_object_bbox: true
+  bbox_iou_thr: 0.25
+  bbox_contain_thr: 0.8
+ownership:
+  enforce_unique_ownership: false
+  recompute_position_after_prune: false
+  rule: affordance_priority
+output:
+  save_ply: true
+  ply_apply_T_out: false
+  ply_voxel_down: 0.0
+  debug: false
+  debug_frames: 3
+  log_every: 50
+results:
+  frames_total: 638
+  frames_used: 638
+  masks_used: 3169
+  semantic_groups: 14
+  objects_count: 14
+  affordances_count: 12
+  total_nodes: 26
