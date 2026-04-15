@@ -227,29 +227,7 @@ def canon_name(name: str, name_map: Dict[str, str]) -> str:
 
 
 def parse_mask_type_name_inst(stem: str) -> Tuple[str, str, str]:
-    """
-    Support both original names and refined names.
-
-    Original examples:
-      CTX__door__000__area1234
-      INT__door_handle__000__area3475
-
-    Refined examples:
-      instance_0001__CTX__door__000__area1234
-      instance_0007__INT__door_handle__000__area3475
-
-    Returns:
-      typ: "object" or "affordance"
-      name: normalized semantic name, e.g. "door handle"
-      inst_id: local mask id parsed from filename (NOT the instance_xxxx prefix)
-    """
     s = stem.strip()
-
-    # 1) strip refined prefix like "instance_0001__"
-    #    allow both lower/upper case just in case
-    s = re.sub(r"^instance_\d+__", "", s, flags=re.IGNORECASE)
-
-    # 2) determine type from the remaining stem
     if s.startswith("CTX"):
         typ, prefix = "object", "CTX"
     elif s.startswith("INT"):
@@ -257,28 +235,26 @@ def parse_mask_type_name_inst(stem: str) -> Tuple[str, str, str]:
     else:
         typ, prefix = "object", None
 
-    # 3) split by "__" first; if not present, fall back to "_"
     parts = [p for p in (s.split("__") if "__" in s else s.split("_")) if p]
-
-    # 4) remove leading CTX / INT token if present
     if prefix and parts and parts[0] == prefix:
         parts = parts[1:]
     elif prefix and parts and parts[0].startswith(prefix):
         parts[0] = parts[0].replace(prefix, "", 1)
 
-    # 5) parse local mask id, stop before area1234
     inst_id = "000"
-    name_tokens = []
+    name_tokens: List[str] = []
     for p in parts:
         if re.fullmatch(r"\d+", p):
             inst_id = p.zfill(3)
             break
         if re.fullmatch(r"area\d+", p, flags=re.IGNORECASE):
             break
-        name_tokens.append(p)
+        if p:
+            name_tokens.append(p)
 
-    name = normalize_name(" ".join(name_tokens).strip() or "unknown")
+    name = normalize_name(re.sub(r"\s+", " ", " ".join(name_tokens)).strip() or "unknown")
     return typ, name, inst_id
+
 
 # ─────────────────────────────────────────────
 # Depth helpers
