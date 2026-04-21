@@ -2,6 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
+Enhanced SAM3 script supporting both text prompts and bbox coordinates.
+
+CSV Format:
+- Text prompts: "door handle", "chair"
+- Bbox prompts: "100,50,300,200" (x1,y1,x2,y2)
+
+Usage:
 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 torchrun --nproc_per_node=8 scenefun3d_sam3_image.py \
 --csv-path /nas/qirui/sam3/scenefun3d_ex/parse_result_30scenes.csv \
 --data-root /nas/qirui/scenefun3d/val \
@@ -9,7 +16,8 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 torchrun --nproc_per_node=8 scenefun3d_sam3
 --image-subdir hires_wide \
 --thr 0.5 \
 --save-vis \
---scene-id 466162
+--scene-id 466162 \
+--bbox-multimask
 """
 
 import argparse
@@ -141,6 +149,33 @@ def normalize_interactive_object(x: str) -> str:
         return "drawer handle"
 
     return normalize_prompt(s)
+
+
+def parse_prompt_type(prompt_str: str) -> tuple[str, str | None]:
+    """
+    Parse prompt string to determine if it's text or bbox format.
+    
+    Returns:
+        (prompt_type, prompt_data)
+        - For text: ("text", "door handle")
+        - For bbox: ("bbox", "100,50,300,200")
+    """
+    prompt_str = prompt_str.strip()
+    
+    # Check if it looks like bbox coordinates (4 numbers separated by commas)
+    if re.match(r'^\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*$', prompt_str):
+        return ("bbox", prompt_str)
+    
+    # Otherwise treat as text prompt
+    return ("text", prompt_str)
+
+
+def parse_bbox_string(bbox_str: str) -> list[float]:
+    """Parse bbox string like '100.5,50.2,300.1,200.8' to [x1, y1, x2, y2]"""
+    coords = [float(x.strip()) for x in bbox_str.split(',')]
+    if len(coords) != 4:
+        raise ValueError(f"Expected 4 coordinates, got {len(coords)}")
+    return coords
 
 
 def _to_numpy(x):
@@ -347,6 +382,73 @@ def set_image_get_state(processor: Sam3Processor, img: Image.Image):
     )
 
 
+def process_bbox_prompt(model, state, bbox_coords: list[float], thr: float, multimask_output: bool = True):
+    """
+    Process bbox prompt using SAM3's predict_inst method.
+    
+    Args:
+        model: SAM3 model instance
+        state: Image state from processor.set_image()
+        bbox_coords: [x1, y1, x2, y2] coordinates
+        thr: Threshold for mask processing
+        multimask_output: Whether to return multiple candidate masks
+    
+    Returns:
+        (masks, boxes, prompt_info)
+    """
+    try:
+        # Convert bbox to numpy array format expected by predict_inst
+        bbox_array = np.array(bbox_coords).reshape(1, 4)  # Shape: (1, 4)
+        
+        # Use predict_inst for bbox prompt
+        masks_np, scores_np, logits_np = model.predict_inst(
+            state,
+            point_coords=None,
+            point_labels=None,
+            box=bbox_array,
+            multimask_output=multimask_output
+        )
+        
+        # Convert results to format compatible with existing pipeline
+        masks = []
+        boxes = []
+        
+        if masks_np is not None and len(masks_np) > 0:
+            for i, mask_np in enumerate(masks_np):
+                # Convert mask to tensor format if needed
+                if isinstance(mask_np, np.ndarray):
+                    mask_tensor = torch.from_numpy(mask_np).float()
+                else:
+                    mask_tensor = mask_np
+                
+                masks.append(mask_tensor)
+                # Use original bbox coordinates for each generated mask
+                boxes.append(bbox_coords)
+        
+        return masks, boxes, f"bbox_{bbox_coords}"
+        
+    except Exception as e:
+        logging.warning(f"Failed to process bbox prompt {bbox_coords}: {e}")
+        return [], [], f"bbox_{bbox_coords}_failed"
+
+
+def process_text_prompt(processor, state, text_prompt: str):
+    """
+    Process text prompt using existing text-based segmentation.
+    
+    Returns:
+        (masks, boxes, prompt_info)
+    """
+    try:
+        out = processor.set_text_prompt(state=state, prompt=text_prompt)
+        masks = out.get("masks", [])
+        boxes = out.get("boxes", [])
+        return masks, boxes, text_prompt
+    except Exception as e:
+        logging.warning(f"Failed to process text prompt '{text_prompt}': {e}")
+        return [], [], f"{text_prompt}_failed"
+
+
 def save_vis(img_pil: Image.Image, overlays: list[dict], out_path: Path, thr=0.5, title: str | None = None):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -393,11 +495,12 @@ def read_csv_prompts(csv_path: Path):
 
     interactive_objects processing:
     - ONLY keep the first item
-    - strip action prefix
-    - normalize to object-only prompt
+    - strip action prefix for text prompts
+    - support bbox format: "100,50,300,200"
+    - normalize to object-only prompt for text
     """
-    scene2ctx = defaultdict(Counter)
-    scene2int = defaultdict(Counter)
+    scene2ctx = defaultdict(list)  # Changed to list to preserve prompt types
+    scene2int = defaultdict(list)  # Changed to list to preserve prompt types
 
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -412,10 +515,17 @@ def read_csv_prompts(csv_path: Path):
                 continue
             sid = int(sid)
 
-            ctx = normalize_prompt(row.get("contextual_object"))
-            if ctx:
-                scene2ctx[sid][ctx] += 1
+            # Process contextual objects
+            ctx = row.get("contextual_object", "").strip()
+            if ctx and ctx.lower() not in {"none", "n/a", "na", ""}:
+                prompt_type, prompt_data = parse_prompt_type(ctx)
+                if prompt_type == "text":
+                    prompt_data = normalize_prompt(prompt_data)
+                
+                if prompt_data:
+                    scene2ctx[sid].append((prompt_type, prompt_data))
 
+            # Process interactive objects
             raw = row.get("interactive_objects", "")
             raw = "" if raw is None else str(raw).strip()
 
@@ -433,9 +543,13 @@ def read_csv_prompts(csv_path: Path):
             elif val is not None:
                 first_item = str(val)
 
-            first_item = normalize_interactive_object(first_item)
             if first_item:
-                scene2int[sid][first_item] += 1
+                prompt_type, prompt_data = parse_prompt_type(first_item)
+                if prompt_type == "text":
+                    prompt_data = normalize_interactive_object(prompt_data)
+                
+                if prompt_data:
+                    scene2int[sid].append((prompt_type, prompt_data))
 
     return scene2ctx, scene2int
 
@@ -586,13 +700,14 @@ def run_scene_frame_sharded(
     processor: Sam3Processor,
     scene_id: int,
     image_dir: Path,
-    ctx_prompts: list[str],
-    int_prompts: list[str],
+    ctx_prompts: list[tuple],  # List of (prompt_type, prompt_data) tuples
+    int_prompts: list[tuple],  # List of (prompt_type, prompt_data) tuples
     out_root: Path,
     thr: float,
     save_vis_flag: bool,
     rank: int,
     world_size: int,
+    bbox_multimask: bool = True,
 ):
     scene_out = out_root / str(scene_id)
     masks_root = scene_out / "masks"
@@ -601,7 +716,12 @@ def run_scene_frame_sharded(
     images = list_images(image_dir)
     num_frames = len(images)
 
-    all_prompts = [("CTX", p) for p in ctx_prompts] + [("INT", p) for p in int_prompts]
+    # Build prompt list with type information
+    all_prompts = []
+    for prompt_type, prompt_data in ctx_prompts:
+        all_prompts.append(("CTX", prompt_type, prompt_data))
+    for prompt_type, prompt_data in int_prompts:
+        all_prompts.append(("INT", prompt_type, prompt_data))
 
     local_indices = [i for i in range(num_frames) if (i % world_size) == rank]
     local_total = len(local_indices)
@@ -635,19 +755,31 @@ def run_scene_frame_sharded(
         overlays = []
         frame_results = []
 
-        for tag, prompt in all_prompts:
+        for tag, prompt_type, prompt_data in all_prompts:
 
             try:
-                out = processor.set_text_prompt(state=state, prompt=prompt)
-                masks = out.get("masks", [])
-                boxes = out.get("boxes", [])
+                # Process different prompt types
+                if prompt_type == "text":
+                    masks, boxes, processed_prompt = process_text_prompt(processor, state, prompt_data)
+                elif prompt_type == "bbox":
+                    bbox_coords = parse_bbox_string(prompt_data)
+                    masks, boxes, processed_prompt = process_bbox_prompt(
+                        processor.model, state, bbox_coords, thr, multimask_output=bbox_multimask
+                    )
+                else:
+                    logging.warning(f"Unknown prompt type: {prompt_type}")
+                    continue
 
                 if masks is None or len(masks) == 0:
                     continue
 
-                final_masks, final_boxes, final_prompt = perform_secondary_segmentation(
-                    processor, state, prompt, masks, boxes, thr
-                )
+                # Only apply secondary segmentation to text prompts
+                if prompt_type == "text":
+                    final_masks, final_boxes, final_prompt = perform_secondary_segmentation(
+                        processor, state, prompt_data, masks, boxes, thr
+                    )
+                else:
+                    final_masks, final_boxes, final_prompt = masks, boxes, processed_prompt
                 
                 # For door handle, only keep the smallest mask to avoid multiple masks for same object
                 if final_prompt.lower() == "door handle" and len(final_masks) > 1:
@@ -761,6 +893,8 @@ def main():
     ap.add_argument("--image-subdir", default="hires_wide")
     ap.add_argument("--thr", type=float, default=0.5)
     ap.add_argument("--save-vis", action="store_true")
+    ap.add_argument("--bbox-multimask", action="store_true", default=True, 
+                   help="Enable multimask output for bbox prompts (returns 3 candidate masks)")
     args = ap.parse_args()
 
     rank, world_size, local_rank = get_dist_info()
@@ -781,8 +915,9 @@ def main():
     scene2ctx, scene2int = read_csv_prompts(Path(args.csv_path))
 
     scene_id = int(args.scene_id)
-    ctx_prompts = [k for k, _ in scene2ctx.get(scene_id, Counter()).most_common()]
-    int_prompts = [k for k, _ in scene2int.get(scene_id, Counter()).most_common()]
+    # Now prompts are lists of (prompt_type, prompt_data) tuples
+    ctx_prompts = scene2ctx.get(scene_id, [])
+    int_prompts = scene2int.get(scene_id, [])
 
     data_root = Path(args.data_root)
     out_root = Path(args.output_root)
@@ -796,14 +931,19 @@ def main():
     if rank == 0:
         scene_out = out_root / str(scene_id)
         scene_out.mkdir(parents=True, exist_ok=True)
+        # Convert tuples to readable format for JSON
+        ctx_prompts_readable = [{"type": ptype, "data": pdata} for ptype, pdata in ctx_prompts]
+        int_prompts_readable = [{"type": ptype, "data": pdata} for ptype, pdata in int_prompts]
+        
         prompt_dump = {
             "scene_id": scene_id,
             "sequence_used": img_dir.parent.name,
             "image_subdir": img_dir.name,
-            "ctx_prompts": ctx_prompts,
-            "int_prompts": int_prompts,
+            "ctx_prompts": ctx_prompts_readable,
+            "int_prompts": int_prompts_readable,
             "world_size": world_size,
             "sharding": "frame_idx % world_size == rank",
+            "prompt_format": "mixed_text_bbox_support"
         }
         (scene_out / "prompts_used.json").write_text(
             json.dumps(prompt_dump, indent=2, ensure_ascii=False),
@@ -826,8 +966,8 @@ def main():
 
         exp_config['data']['ctx_prompts_count'] = len(ctx_prompts)
         exp_config['data']['int_prompts_count'] = len(int_prompts)
-        exp_config['data']['ctx_prompts'] = ctx_prompts[:5] + ['...'] if len(ctx_prompts) > 5 else ctx_prompts
-        exp_config['data']['int_prompts'] = int_prompts[:5] + ['...'] if len(int_prompts) > 5 else int_prompts
+        exp_config['data']['ctx_prompts'] = ctx_prompts_readable[:5] + [{"type": "truncated", "data": "..."}] if len(ctx_prompts) > 5 else ctx_prompts_readable
+        exp_config['data']['int_prompts'] = int_prompts_readable[:5] + [{"type": "truncated", "data": "..."}] if len(int_prompts) > 5 else int_prompts_readable
         exp_config['processing'] = {
             'sharding_strategy': 'frame_idx % world_size == rank',
             'frame_distribution': f'rank {rank} of {world_size}'
@@ -853,6 +993,7 @@ def main():
             save_vis_flag=args.save_vis,
             rank=rank,
             world_size=world_size,
+            bbox_multimask=args.bbox_multimask,
         )
 
 
