@@ -2,22 +2,39 @@
 # -*- coding: utf-8 -*-
 
 """
-Enhanced SAM3 script supporting both text prompts and bbox coordinates.
+Examples
+--------
+1) Batch scene mode (original behavior)
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 torchrun --nproc_per_node=8 scenefun3d_sam3_image_dual_mode.py \
+  --csv-path /nas/qirui/sam3/scenefun3d_ex/src/parse_result_30scenes.csv \
+  --data-root /nas/qirui/scenefun3d/val \
+  --output-root /nas/qirui/sam3/scenefun3d_ex/experiments/exp_01_doorhandle_fallback \
+  --image-subdir hires_wide \
+  --thr 0.5 \
+  --save-vis \
+  --scene-id 466162
 
-CSV Format:
-- Text prompts: "door handle", "chair"
-- Bbox prompts: "100,50,300,200" (x1,y1,x2,y2)
+2) Single image mode with manual prompts
+python scenefun3d_sam3_image_dual_mode.py \
+  --image-path /path/to/image.jpg \
+  --output-root /tmp/sam3_single \
+  --ctx-prompts cabinet door drawer \
+  --int-prompts "door handle" "light switch" \
+  --thr 0.5 \
+  --save-vis
 
-Usage:
-CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 torchrun --nproc_per_node=8 scenefun3d_sam3_image.py \
---csv-path /nas/qirui/sam3/scenefun3d_ex/parse_result_30scenes.csv \
---data-root /nas/qirui/scenefun3d/val \
---output-root /nas/qirui/sam3/scenefun3d_ex/experiments/exp_01_doorhandle_fallback \
---image-subdir hires_wide \
---thr 0.5 \
---save-vis \
---scene-id 466162 \
---bbox-multimask
+3) Single image mode using prompts from json
+python scenefun3d_sam3_image_dual_mode.py \
+  --image-path /path/to/image.jpg \
+  --output-root /tmp/sam3_single \
+  --prompts-json /path/to/prompts.json \
+  --thr 0.5
+
+prompts.json format:
+{
+  "ctx_prompts": ["cabinet", "drawer"],
+  "int_prompts": ["door handle", "light switch"]
+}
 """
 
 import argparse
@@ -80,6 +97,35 @@ def normalize_prompt(s: str) -> str:
     if s.lower() in {"none", "n/a", "na", ""}:
         return ""
     return re.sub(r"\s+", " ", s)
+
+
+def normalize_prompt_list(values):
+    if values is None:
+        return []
+
+    out = []
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str) and "," in v:
+            pieces = [x.strip() for x in v.split(",")]
+        else:
+            pieces = [v]
+
+        for p in pieces:
+            p = normalize_prompt(p)
+            if p:
+                out.append(p)
+
+    deduped = []
+    seen = set()
+    for x in out:
+        key = x.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(x)
+    return deduped
 
 
 def strip_action_prefix_for_interactive_object(s: str) -> str:
@@ -149,33 +195,6 @@ def normalize_interactive_object(x: str) -> str:
         return "drawer handle"
 
     return normalize_prompt(s)
-
-
-def parse_prompt_type(prompt_str: str) -> tuple[str, str | None]:
-    """
-    Parse prompt string to determine if it's text or bbox format.
-    
-    Returns:
-        (prompt_type, prompt_data)
-        - For text: ("text", "door handle")
-        - For bbox: ("bbox", "100,50,300,200")
-    """
-    prompt_str = prompt_str.strip()
-    
-    # Check if it looks like bbox coordinates (4 numbers separated by commas)
-    if re.match(r'^\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*$', prompt_str):
-        return ("bbox", prompt_str)
-    
-    # Otherwise treat as text prompt
-    return ("text", prompt_str)
-
-
-def parse_bbox_string(bbox_str: str) -> list[float]:
-    """Parse bbox string like '100.5,50.2,300.1,200.8' to [x1, y1, x2, y2]"""
-    coords = [float(x.strip()) for x in bbox_str.split(',')]
-    if len(coords) != 4:
-        raise ValueError(f"Expected 4 coordinates, got {len(coords)}")
-    return coords
 
 
 def _to_numpy(x):
@@ -263,7 +282,6 @@ def dedup_int_masks_keep_smaller(
 
             overlap_small = mask_overlap_on_smaller(masks[i], masks[j], thr)
 
-
             if overlap_small >= overlap_thr:
                 if areas[i] <= areas[j]:
                     keep[j] = False
@@ -317,34 +335,29 @@ def dedup_frame_level_door_handles(
 
             overlap_small = mask_overlap_on_smaller(items[i]["mask"], items[j]["mask"], thr)
 
-
             if overlap_small >= overlap_thr:
-                # Priority logic: rotate door handle > door handle (when rotate is smaller)
                 prompt_i = items[i].get('prompt', '').lower()
                 prompt_j = items[j].get('prompt', '').lower()
-                
-                # Both are same prompt OR at least one is not door handle related: keep smaller
+
                 if (prompt_i == prompt_j) or (prompt_i not in ['door handle', 'rotate door handle'] and prompt_j not in ['door handle', 'rotate door handle']):
                     if areas[i] <= areas[j]:
                         keep[j] = False
                     else:
                         keep[i] = False
                         break
-                # One is rotate door handle, one is door handle: prioritize rotate if smaller
                 elif prompt_i == 'rotate door handle' and prompt_j == 'door handle':
                     if areas[i] < areas[j]:
-                        keep[j] = False  # Keep rotate (i), remove door handle (j)
+                        keep[j] = False
                     else:
-                        keep[i] = False  # Remove rotate (i), keep door handle (j)
+                        keep[i] = False
                         break
                 elif prompt_i == 'door handle' and prompt_j == 'rotate door handle':
                     if areas[j] < areas[i]:
-                        keep[i] = False  # Keep rotate (j), remove door handle (i)
+                        keep[i] = False
                         break
                     else:
-                        keep[j] = False  # Remove rotate (j), keep door handle (i)
+                        keep[j] = False
                 else:
-                    # Default: keep smaller
                     if areas[i] <= areas[j]:
                         keep[j] = False
                     else:
@@ -380,73 +393,6 @@ def set_image_get_state(processor: Sam3Processor, img: Image.Image):
         "You must call set_image before set_text_prompt, but set_image returned None "
         "and no internal state attribute was found."
     )
-
-
-def process_bbox_prompt(model, state, bbox_coords: list[float], thr: float, multimask_output: bool = True):
-    """
-    Process bbox prompt using SAM3's predict_inst method.
-    
-    Args:
-        model: SAM3 model instance
-        state: Image state from processor.set_image()
-        bbox_coords: [x1, y1, x2, y2] coordinates
-        thr: Threshold for mask processing
-        multimask_output: Whether to return multiple candidate masks
-    
-    Returns:
-        (masks, boxes, prompt_info)
-    """
-    try:
-        # Convert bbox to numpy array format expected by predict_inst
-        bbox_array = np.array(bbox_coords).reshape(1, 4)  # Shape: (1, 4)
-        
-        # Use predict_inst for bbox prompt
-        masks_np, scores_np, logits_np = model.predict_inst(
-            state,
-            point_coords=None,
-            point_labels=None,
-            box=bbox_array,
-            multimask_output=multimask_output
-        )
-        
-        # Convert results to format compatible with existing pipeline
-        masks = []
-        boxes = []
-        
-        if masks_np is not None and len(masks_np) > 0:
-            for i, mask_np in enumerate(masks_np):
-                # Convert mask to tensor format if needed
-                if isinstance(mask_np, np.ndarray):
-                    mask_tensor = torch.from_numpy(mask_np).float()
-                else:
-                    mask_tensor = mask_np
-                
-                masks.append(mask_tensor)
-                # Use original bbox coordinates for each generated mask
-                boxes.append(bbox_coords)
-        
-        return masks, boxes, f"bbox_{bbox_coords}"
-        
-    except Exception as e:
-        logging.warning(f"Failed to process bbox prompt {bbox_coords}: {e}")
-        return [], [], f"bbox_{bbox_coords}_failed"
-
-
-def process_text_prompt(processor, state, text_prompt: str):
-    """
-    Process text prompt using existing text-based segmentation.
-    
-    Returns:
-        (masks, boxes, prompt_info)
-    """
-    try:
-        out = processor.set_text_prompt(state=state, prompt=text_prompt)
-        masks = out.get("masks", [])
-        boxes = out.get("boxes", [])
-        return masks, boxes, text_prompt
-    except Exception as e:
-        logging.warning(f"Failed to process text prompt '{text_prompt}': {e}")
-        return [], [], f"{text_prompt}_failed"
 
 
 def save_vis(img_pil: Image.Image, overlays: list[dict], out_path: Path, thr=0.5, title: str | None = None):
@@ -495,12 +441,11 @@ def read_csv_prompts(csv_path: Path):
 
     interactive_objects processing:
     - ONLY keep the first item
-    - strip action prefix for text prompts
-    - support bbox format: "100,50,300,200"
-    - normalize to object-only prompt for text
+    - strip action prefix
+    - normalize to object-only prompt
     """
-    scene2ctx = defaultdict(list)  # Changed to list to preserve prompt types
-    scene2int = defaultdict(list)  # Changed to list to preserve prompt types
+    scene2ctx = defaultdict(Counter)
+    scene2int = defaultdict(Counter)
 
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -515,17 +460,10 @@ def read_csv_prompts(csv_path: Path):
                 continue
             sid = int(sid)
 
-            # Process contextual objects
-            ctx = row.get("contextual_object", "").strip()
-            if ctx and ctx.lower() not in {"none", "n/a", "na", ""}:
-                prompt_type, prompt_data = parse_prompt_type(ctx)
-                if prompt_type == "text":
-                    prompt_data = normalize_prompt(prompt_data)
-                
-                if prompt_data:
-                    scene2ctx[sid].append((prompt_type, prompt_data))
+            ctx = normalize_prompt(row.get("contextual_object"))
+            if ctx:
+                scene2ctx[sid][ctx] += 1
 
-            # Process interactive objects
             raw = row.get("interactive_objects", "")
             raw = "" if raw is None else str(raw).strip()
 
@@ -543,13 +481,9 @@ def read_csv_prompts(csv_path: Path):
             elif val is not None:
                 first_item = str(val)
 
+            first_item = normalize_interactive_object(first_item)
             if first_item:
-                prompt_type, prompt_data = parse_prompt_type(first_item)
-                if prompt_type == "text":
-                    prompt_data = normalize_interactive_object(prompt_data)
-                
-                if prompt_data:
-                    scene2int[sid].append((prompt_type, prompt_data))
+                scene2int[sid][first_item] += 1
 
     return scene2ctx, scene2int
 
@@ -587,14 +521,15 @@ def setup_logging(log_file=None, level=logging.INFO):
     return log_file
 
 
-def create_experiment_config(scene_id, world_size, rank, cuda_available, cuda_device_count,
-                             current_device, csv_path, data_root, output_root, threshold=0.5):
+def create_experiment_config(mode, world_size, rank, cuda_available, cuda_device_count,
+                             current_device, threshold=0.5, **kwargs):
     config = {
         'experiment': {
             'timestamp': datetime.now().isoformat(),
-            'script_name': 'scenefun3d_sam3_image.py',
-            'version': '1.5.0',
-            'description': 'Read object-only INT prompts from CSV, use fixed secondary prompt rotate door handle for door handle, and add frame-level door handle dedup with rotate priority'
+            'script_name': 'scenefun3d_sam3_image_dual_mode.py',
+            'version': '2.0.0',
+            'mode': mode,
+            'description': 'Support both batch-scene mode and single-image mode'
         },
         'hardware': {
             'world_size': world_size,
@@ -603,17 +538,10 @@ def create_experiment_config(scene_id, world_size, rank, cuda_available, cuda_de
             'cuda_device_count': cuda_device_count,
             'current_device': current_device
         },
-        'data': {
-            'scene_id': scene_id,
-            'csv_path': csv_path,
-            'data_root': data_root,
-            'output_root': output_root,
-            'image_subdir': 'hires_wide'
-        },
         'model': {
             'name': 'SAM3',
             'threshold': threshold,
-            'save_visualization': True
+            'save_visualization': kwargs.get('save_vis', False)
         },
         'features': {
             'read_int_prompt_object_only': True,
@@ -628,7 +556,8 @@ def create_experiment_config(scene_id, world_size, rank, cuda_available, cuda_de
             'frame_level_door_handle_metric': 'intersection_over_smaller_area',
             'frame_level_door_handle_overlap_threshold': 0.7,
             'frame_level_door_handle_keep_rule': 'keep_smaller_area'
-        }
+        },
+        'data': kwargs,
     }
     return config
 
@@ -652,11 +581,6 @@ def is_door_handle_prompt(prompt: str) -> bool:
 
 
 def get_secondary_door_handle_prompt(original_prompt: str) -> str:
-    """
-    New logic:
-    - read CSV prompt as object-only prompt
-    - if prompt is exactly 'door handle', fixed secondary prompt is 'rotate door handle'
-    """
     if is_door_handle_prompt(original_prompt):
         return "rotate door handle"
     return None
@@ -679,7 +603,6 @@ def perform_secondary_segmentation(processor, state, original_prompt: str, origi
         original_total_area = sum(mask_area(m, thr) for m in original_masks)
         secondary_total_area = sum(mask_area(m, thr) for m in secondary_masks)
 
-
         if secondary_total_area > 0 and secondary_total_area < original_total_area:
             return secondary_masks, secondary_boxes, secondary_prompt
         else:
@@ -696,18 +619,169 @@ def list_images(d: Path):
     return sorted(imgs, key=natural_key)
 
 
+def load_prompts_from_json(json_path: Path):
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    ctx_prompts = normalize_prompt_list(data.get("ctx_prompts", []))
+    int_prompts = normalize_prompt_list(data.get("int_prompts", []))
+    return ctx_prompts, int_prompts
+
+
+def resolve_prompts(args):
+    ctx_prompts = []
+    int_prompts = []
+    prompt_source = None
+
+    if args.prompts_json is not None:
+        ctx_prompts, int_prompts = load_prompts_from_json(Path(args.prompts_json))
+        prompt_source = f"prompts_json:{args.prompts_json}"
+
+    manual_ctx = normalize_prompt_list(args.ctx_prompts)
+    manual_int = normalize_prompt_list(args.int_prompts)
+
+    if manual_ctx or manual_int:
+        ctx_prompts = manual_ctx
+        int_prompts = manual_int
+        prompt_source = "manual_args"
+
+    if (not ctx_prompts and not int_prompts) and args.csv_path is not None and args.scene_id is not None:
+        scene2ctx, scene2int = read_csv_prompts(Path(args.csv_path))
+        scene_id = int(args.scene_id)
+        ctx_prompts = [k for k, _ in scene2ctx.get(scene_id, Counter()).most_common()]
+        int_prompts = [k for k, _ in scene2int.get(scene_id, Counter()).most_common()]
+        prompt_source = f"csv_scene:{args.scene_id}"
+
+    return ctx_prompts, int_prompts, prompt_source
+
+
+def process_single_frame(
+    processor: Sam3Processor,
+    img: Image.Image,
+    all_prompts,
+    frame_dir: Path,
+    vis_out: Path | None,
+    thr: float,
+    vis_title: str | None = None,
+):
+    state = set_image_get_state(processor, img)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    overlays = []
+    frame_results = []
+
+    for tag, prompt in all_prompts:
+        out = processor.set_text_prompt(state=state, prompt=prompt)
+        masks = out.get("masks", [])
+        boxes = out.get("boxes", [])
+
+        if masks is None or len(masks) == 0:
+            continue
+
+        final_masks, final_boxes, final_prompt = perform_secondary_segmentation(
+            processor, state, prompt, masks, boxes, thr
+        )
+
+        if final_prompt.lower() == "door handle" and len(final_masks) > 1:
+            areas = [mask_area(m, thr) for m in final_masks]
+            valid_areas = [a for a in areas if a > 0]
+            if valid_areas:
+                min_area = min(valid_areas)
+                best_idx = areas.index(min_area)
+                final_masks = [final_masks[best_idx]]
+                if final_boxes is not None and len(final_boxes) > best_idx:
+                    final_boxes = [final_boxes[best_idx]]
+                else:
+                    final_boxes = None
+
+        cls = sanitize_class_name(final_prompt)
+
+        if tag == "INT":
+            final_masks, final_boxes = dedup_int_masks_keep_smaller(
+                final_masks,
+                final_boxes,
+                thr=thr,
+                overlap_thr=0.9,
+            )
+
+        for mi, m in enumerate(final_masks):
+            area = mask_area(m, thr)
+            if area <= 0:
+                continue
+
+            box = final_boxes[mi] if final_boxes is not None and mi < len(final_boxes) else None
+
+            frame_results.append({
+                "tag": tag,
+                "cls": cls,
+                "mask": m,
+                "box": box,
+                "area": area,
+                "prompt": final_prompt,
+            })
+
+    door_items = []
+    other_items = []
+    for item in frame_results:
+        if item["tag"] == "INT" and item["cls"] == "door_handle":
+            door_items.append(item)
+        else:
+            other_items.append(item)
+
+    if len(door_items) > 1:
+        door_items = dedup_frame_level_door_handles(
+            door_items,
+            thr=thr,
+            overlap_thr=0.7,
+        )
+
+    frame_results = other_items + door_items
+
+    class_counters = defaultdict(int)
+    for item in frame_results:
+        tag = item["tag"]
+        cls = item["cls"]
+        m = item["mask"]
+        box = item["box"]
+        area = item["area"]
+
+        idx = class_counters[(tag, cls)]
+        class_counters[(tag, cls)] += 1
+
+        save_mask_png(
+            m,
+            frame_dir / f"{tag}__{cls}__{idx:03d}__area{area}.png",
+            thr,
+        )
+        overlays.append({"mask": m, "box": box})
+
+    if vis_out is not None:
+        save_vis(img_pil=img, overlays=overlays, out_path=vis_out, thr=thr, title=vis_title)
+
+    summary = {
+        "num_results": len(frame_results),
+        "results": [
+            {
+                "tag": item["tag"],
+                "cls": item["cls"],
+                "area": int(item["area"]),
+                "prompt": item["prompt"],
+            }
+            for item in frame_results
+        ]
+    }
+    return summary
+
+
 def run_scene_frame_sharded(
     processor: Sam3Processor,
     scene_id: int,
     image_dir: Path,
-    ctx_prompts: list[tuple],  # List of (prompt_type, prompt_data) tuples
-    int_prompts: list[tuple],  # List of (prompt_type, prompt_data) tuples
+    ctx_prompts: list[str],
+    int_prompts: list[str],
     out_root: Path,
     thr: float,
     save_vis_flag: bool,
     rank: int,
     world_size: int,
-    bbox_multimask: bool = True,
 ):
     scene_out = out_root / str(scene_id)
     masks_root = scene_out / "masks"
@@ -716,12 +790,7 @@ def run_scene_frame_sharded(
     images = list_images(image_dir)
     num_frames = len(images)
 
-    # Build prompt list with type information
-    all_prompts = []
-    for prompt_type, prompt_data in ctx_prompts:
-        all_prompts.append(("CTX", prompt_type, prompt_data))
-    for prompt_type, prompt_data in int_prompts:
-        all_prompts.append(("INT", prompt_type, prompt_data))
+    all_prompts = [("CTX", p) for p in ctx_prompts] + [("INT", p) for p in int_prompts]
 
     local_indices = [i for i in range(num_frames) if (i % world_size) == rank]
     local_total = len(local_indices)
@@ -742,160 +811,106 @@ def run_scene_frame_sharded(
 
     for fi in pbar:
         img_path = images[fi]
-
-        try:
-            img = Image.open(img_path).convert("RGB")
-            state = set_image_get_state(processor, img)
-        except Exception:
-            raise
+        img = Image.open(img_path).convert("RGB")
 
         frame_dir = masks_root / str(fi)
-        frame_dir.mkdir(parents=True, exist_ok=True)
+        vis_out = scene_out / "vis" / f"{fi:06d}.png" if save_vis_flag else None
 
-        overlays = []
-        frame_results = []
-
-        for tag, prompt_type, prompt_data in all_prompts:
-
-            try:
-                # Process different prompt types
-                if prompt_type == "text":
-                    masks, boxes, processed_prompt = process_text_prompt(processor, state, prompt_data)
-                elif prompt_type == "bbox":
-                    bbox_coords = parse_bbox_string(prompt_data)
-                    masks, boxes, processed_prompt = process_bbox_prompt(
-                        processor.model, state, bbox_coords, thr, multimask_output=bbox_multimask
-                    )
-                else:
-                    logging.warning(f"Unknown prompt type: {prompt_type}")
-                    continue
-
-                if masks is None or len(masks) == 0:
-                    continue
-
-                # Only apply secondary segmentation to text prompts
-                if prompt_type == "text":
-                    final_masks, final_boxes, final_prompt = perform_secondary_segmentation(
-                        processor, state, prompt_data, masks, boxes, thr
-                    )
-                else:
-                    final_masks, final_boxes, final_prompt = masks, boxes, processed_prompt
-                
-                # For door handle, only keep the smallest mask to avoid multiple masks for same object
-                if final_prompt.lower() == "door handle" and len(final_masks) > 1:
-                    areas = [mask_area(m, thr) for m in final_masks]
-                    valid_areas = [a for a in areas if a > 0]
-                    if valid_areas:
-                        min_area = min(valid_areas)
-                        best_idx = areas.index(min_area)
-                        final_masks = [final_masks[best_idx]]
-                        if final_boxes is not None and len(final_boxes) > best_idx:
-                            final_boxes = [final_boxes[best_idx]]
-                        else:
-                            final_boxes = None
-
-                cls = sanitize_class_name(final_prompt)
-
-                if tag == "INT":
-                    final_masks, final_boxes = dedup_int_masks_keep_smaller(
-                        final_masks,
-                        final_boxes,
-                        thr=thr,
-                        overlap_thr=0.9,
-                    )
-
-                for mi, m in enumerate(final_masks):
-                    area = mask_area(m, thr)
-                    if area <= 0:
-                        continue
-
-                    box = final_boxes[mi] if final_boxes is not None and mi < len(final_boxes) else None
-
-                    frame_results.append({
-                        "tag": tag,
-                        "cls": cls,
-                        "mask": m,
-                        "box": box,
-                        "area": area,
-                        "prompt": final_prompt,
-                    })
-
-            except Exception:
-                raise
-
-        # ------------------------------------------------------------
-        # Frame-level dedup for all door_handle masks in this frame
-        # ------------------------------------------------------------
-        door_items = []
-        other_items = []
-
-        for item in frame_results:
-            if item["tag"] == "INT" and item["cls"] == "door_handle":
-                door_items.append(item)
-            else:
-                other_items.append(item)
-
-        if len(door_items) > 1:
-            door_items = dedup_frame_level_door_handles(
-                door_items,
-                thr=thr,
-                overlap_thr=0.7,
-            )
-
-        frame_results = other_items + door_items
-
-        # ------------------------------------------------------------
-        # Save all masks after frame-level dedup
-        # ------------------------------------------------------------
-        class_counters = defaultdict(int)
-
-        for item in frame_results:
-            tag = item["tag"]
-            cls = item["cls"]
-            m = item["mask"]
-            box = item["box"]
-            area = item["area"]
-
-            idx = class_counters[(tag, cls)]
-            class_counters[(tag, cls)] += 1
-
-            save_mask_png(
-                m,
-                frame_dir / f"{tag}__{cls}__{idx:03d}__area{area}.png",
-                thr
-            )
-
-            overlays.append({"mask": m, "box": box})
-
-        if save_vis_flag:
-            try:
-                vis_out = scene_out / "vis" / f"{fi:06d}.png"
-                save_vis(
-                    img_pil=img,
-                    overlays=overlays,
-                    out_path=vis_out,
-                    thr=thr,
-                    title=f"{scene_id} {image_dir.parent.name} frame={fi:06d} rank={rank}",
-                )
-            except Exception:
-                pass
+        process_single_frame(
+            processor=processor,
+            img=img,
+            all_prompts=all_prompts,
+            frame_dir=frame_dir,
+            vis_out=vis_out,
+            thr=thr,
+            vis_title=f"{scene_id} {image_dir.parent.name} frame={fi:06d} rank={rank}",
+        )
 
     if rank == 0:
         logging.info(f"Frame processing completed for scene {scene_id}. Processed {local_total} frames on rank {rank}.")
 
 
+def run_single_image(
+    processor: Sam3Processor,
+    image_path: Path,
+    ctx_prompts: list[str],
+    int_prompts: list[str],
+    out_root: Path,
+    thr: float,
+    save_vis_flag: bool,
+    rank: int,
+):
+    if rank != 0:
+        logging.info("Single-image mode only runs on rank 0. Other ranks exit without processing.")
+        return
+
+    img = Image.open(image_path).convert("RGB")
+    stem = sanitize_class_name(image_path.stem)
+    single_out = out_root / "single_image" / stem
+    masks_root = single_out / "masks"
+    summary_path = single_out / "summary.json"
+    vis_out = single_out / "vis.png" if save_vis_flag else None
+
+    all_prompts = [("CTX", p) for p in ctx_prompts] + [("INT", p) for p in int_prompts]
+    summary = process_single_frame(
+        processor=processor,
+        img=img,
+        all_prompts=all_prompts,
+        frame_dir=masks_root,
+        vis_out=vis_out,
+        thr=thr,
+        vis_title=f"single_image: {image_path.name}",
+    )
+    summary.update({
+        "image_path": str(image_path),
+        "ctx_prompts": ctx_prompts,
+        "int_prompts": int_prompts,
+    })
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    logging.info(f"Single-image processing completed: {image_path}")
+    logging.info(f"Summary saved to: {summary_path}")
+
+
+def validate_args(args):
+    has_scene_mode = args.scene_id is not None
+    has_single_image_mode = args.image_path is not None
+
+    if has_scene_mode and has_single_image_mode:
+        raise ValueError("Choose only one mode: either --scene-id (batch scene mode) or --image-path (single image mode).")
+
+    if not has_scene_mode and not has_single_image_mode:
+        raise ValueError("You must provide either --scene-id for batch scene mode or --image-path for single image mode.")
+
+    if has_scene_mode:
+        if args.csv_path is None:
+            raise ValueError("Batch scene mode requires --csv-path.")
+        if args.data_root is None:
+            raise ValueError("Batch scene mode requires --data-root.")
+
+    if has_single_image_mode:
+        if args.prompts_json is None and not args.ctx_prompts and not args.int_prompts:
+            if not (args.csv_path is not None and args.scene_id is not None):
+                raise ValueError(
+                    "Single image mode requires prompts. Provide one of: --prompts-json, --ctx-prompts/--int-prompts."
+                )
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv-path", required=True)
-    ap.add_argument("--data-root", required=True)
+    ap.add_argument("--csv-path", default=None)
+    ap.add_argument("--data-root", default=None)
     ap.add_argument("--output-root", required=True)
-    ap.add_argument("--scene-id", type=int, required=True, help="Run ONE scene; all GPUs collaborate on it.")
+    ap.add_argument("--scene-id", type=int, default=None, help="Run ONE scene; all GPUs collaborate on it.")
+    ap.add_argument("--image-path", default=None, help="Run a single image.")
+    ap.add_argument("--prompts-json", default=None, help="JSON file with keys: ctx_prompts, int_prompts")
+    ap.add_argument("--ctx-prompts", nargs="*", default=None, help="Manual contextual prompts. Supports space-separated or comma-separated values.")
+    ap.add_argument("--int-prompts", nargs="*", default=None, help="Manual interactive prompts. Supports space-separated or comma-separated values.")
     ap.add_argument("--image-subdir", default="hires_wide")
     ap.add_argument("--thr", type=float, default=0.5)
     ap.add_argument("--save-vis", action="store_true")
-    ap.add_argument("--bbox-multimask", action="store_true", default=True, 
-                   help="Enable multimask output for bbox prompts (returns 3 candidate masks)")
     args = ap.parse_args()
+
+    validate_args(args)
 
     rank, world_size, local_rank = get_dist_info()
 
@@ -912,89 +927,128 @@ def main():
                 f"device count: {torch.cuda.device_count()}, current device: {local_rank}"
             )
 
-    scene2ctx, scene2int = read_csv_prompts(Path(args.csv_path))
+    ctx_prompts, int_prompts, prompt_source = resolve_prompts(args)
+    if not ctx_prompts and not int_prompts:
+        raise RuntimeError("No prompts resolved. Check your CSV / prompts-json / manual prompt arguments.")
 
-    scene_id = int(args.scene_id)
-    # Now prompts are lists of (prompt_type, prompt_data) tuples
-    ctx_prompts = scene2ctx.get(scene_id, [])
-    int_prompts = scene2int.get(scene_id, [])
-
-    data_root = Path(args.data_root)
     out_root = Path(args.output_root)
 
-    img_dir = find_first_sequence_image_dir(data_root, scene_id, args.image_subdir)
-    if img_dir is None:
-        raise RuntimeError(
-            f"scene {scene_id}: cannot find first sequence with subdir '{args.image_subdir}' under {data_root}/{scene_id}"
-        )
-
-    if rank == 0:
-        scene_out = out_root / str(scene_id)
-        scene_out.mkdir(parents=True, exist_ok=True)
-        # Convert tuples to readable format for JSON
-        ctx_prompts_readable = [{"type": ptype, "data": pdata} for ptype, pdata in ctx_prompts]
-        int_prompts_readable = [{"type": ptype, "data": pdata} for ptype, pdata in int_prompts]
-        
-        prompt_dump = {
-            "scene_id": scene_id,
-            "sequence_used": img_dir.parent.name,
-            "image_subdir": img_dir.name,
-            "ctx_prompts": ctx_prompts_readable,
-            "int_prompts": int_prompts_readable,
-            "world_size": world_size,
-            "sharding": "frame_idx % world_size == rank",
-            "prompt_format": "mixed_text_bbox_support"
-        }
-        (scene_out / "prompts_used.json").write_text(
-            json.dumps(prompt_dump, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-        logging.info(f"Prompts saved for scene {scene_id}")
-
-        exp_config = create_experiment_config(
-            scene_id=scene_id,
-            world_size=world_size,
-            rank=rank,
-            cuda_available=torch.cuda.is_available(),
-            cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            current_device=local_rank,
-            csv_path=args.csv_path,
-            data_root=str(data_root),
-            output_root=str(out_root),
-            threshold=args.thr
-        )
-
-        exp_config['data']['ctx_prompts_count'] = len(ctx_prompts)
-        exp_config['data']['int_prompts_count'] = len(int_prompts)
-        exp_config['data']['ctx_prompts'] = ctx_prompts_readable[:5] + [{"type": "truncated", "data": "..."}] if len(ctx_prompts) > 5 else ctx_prompts_readable
-        exp_config['data']['int_prompts'] = int_prompts_readable[:5] + [{"type": "truncated", "data": "..."}] if len(int_prompts) > 5 else int_prompts_readable
-        exp_config['processing'] = {
-            'sharding_strategy': 'frame_idx % world_size == rank',
-            'frame_distribution': f'rank {rank} of {world_size}'
-        }
-
-        save_experiment_config(exp_config, str(scene_out))
-
     model = build_sam3_image_model()
-    model = model.to(torch.device(f"cuda:{local_rank}"))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     model.eval()
     processor = Sam3Processor(model)
 
-    with torch.no_grad():
+    mode = "single_image" if args.image_path is not None else "batch_scene"
 
-        run_scene_frame_sharded(
-            processor=processor,
-            scene_id=scene_id,
-            image_dir=img_dir,
-            ctx_prompts=ctx_prompts,
-            int_prompts=int_prompts,
-            out_root=out_root,
-            thr=args.thr,
-            save_vis_flag=args.save_vis,
-            rank=rank,
-            world_size=world_size,
-            bbox_multimask=args.bbox_multimask,
-        )
+    if rank == 0:
+        config_kwargs = {
+            'output_root': str(out_root),
+            'prompt_source': prompt_source,
+            'ctx_prompts_count': len(ctx_prompts),
+            'int_prompts_count': len(int_prompts),
+            'ctx_prompts': ctx_prompts,
+            'int_prompts': int_prompts,
+            'save_vis': args.save_vis,
+        }
+        if mode == "batch_scene":
+            data_root = Path(args.data_root)
+            scene_out = out_root / str(args.scene_id)
+            scene_out.mkdir(parents=True, exist_ok=True)
+            config_kwargs.update({
+                'scene_id': int(args.scene_id),
+                'csv_path': args.csv_path,
+                'data_root': str(data_root),
+                'image_subdir': args.image_subdir,
+                'sharding_strategy': 'frame_idx % world_size == rank',
+                'frame_distribution': f'rank {rank} of {world_size}',
+            })
+            prompt_dump = {
+                "scene_id": int(args.scene_id),
+                "image_subdir": args.image_subdir,
+                "ctx_prompts": ctx_prompts,
+                "int_prompts": int_prompts,
+                "world_size": world_size,
+                "sharding": "frame_idx % world_size == rank",
+                "prompt_source": prompt_source,
+            }
+            (scene_out / "prompts_used.json").write_text(
+                json.dumps(prompt_dump, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            save_experiment_config(
+                create_experiment_config(
+                    mode=mode,
+                    world_size=world_size,
+                    rank=rank,
+                    cuda_available=torch.cuda.is_available(),
+                    cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                    current_device=local_rank,
+                    threshold=args.thr,
+                    **config_kwargs,
+                ),
+                str(scene_out),
+            )
+        else:
+            single_root = out_root / "single_image" / sanitize_class_name(Path(args.image_path).stem)
+            single_root.mkdir(parents=True, exist_ok=True)
+            config_kwargs.update({
+                'image_path': args.image_path,
+            })
+            save_experiment_config(
+                create_experiment_config(
+                    mode=mode,
+                    world_size=world_size,
+                    rank=rank,
+                    cuda_available=torch.cuda.is_available(),
+                    cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                    current_device=local_rank,
+                    threshold=args.thr,
+                    **config_kwargs,
+                ),
+                str(single_root),
+            )
+
+    with torch.no_grad():
+        if mode == "batch_scene":
+            data_root = Path(args.data_root)
+            scene_id = int(args.scene_id)
+            img_dir = find_first_sequence_image_dir(data_root, scene_id, args.image_subdir)
+            if img_dir is None:
+                raise RuntimeError(
+                    f"scene {scene_id}: cannot find first sequence with subdir '{args.image_subdir}' under {data_root}/{scene_id}"
+                )
+            if rank == 0:
+                scene_out = out_root / str(scene_id)
+                prompt_dump_path = scene_out / "prompts_used.json"
+                if prompt_dump_path.exists():
+                    prompt_dump = json.loads(prompt_dump_path.read_text(encoding="utf-8"))
+                    prompt_dump["sequence_used"] = img_dir.parent.name
+                    prompt_dump["image_subdir"] = img_dir.name
+                    prompt_dump_path.write_text(json.dumps(prompt_dump, indent=2, ensure_ascii=False), encoding="utf-8")
+            run_scene_frame_sharded(
+                processor=processor,
+                scene_id=scene_id,
+                image_dir=img_dir,
+                ctx_prompts=ctx_prompts,
+                int_prompts=int_prompts,
+                out_root=out_root,
+                thr=args.thr,
+                save_vis_flag=args.save_vis,
+                rank=rank,
+                world_size=world_size,
+            )
+        else:
+            run_single_image(
+                processor=processor,
+                image_path=Path(args.image_path),
+                ctx_prompts=ctx_prompts,
+                int_prompts=int_prompts,
+                out_root=out_root,
+                thr=args.thr,
+                save_vis_flag=args.save_vis,
+                rank=rank,
+            )
 
 
 if __name__ == "__main__":
